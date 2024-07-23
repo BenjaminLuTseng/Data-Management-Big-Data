@@ -1,0 +1,106 @@
+
+# Initialization
+```{r}
+cat("\014") # clears console
+rm(list = ls()) # clears global environment
+try(dev.off(dev.list()["RStudioGD"]), silent = TRUE) # clears plots
+try(p_unload(p_loaded(), character.only = TRUE), silent = TRUE) # clears packages
+options(scipen = 100) # disables scientific notion for entire R session
+```
+# Import Spark Packages
+```{r}
+library(sparklyr)
+library(pacman)
+library(dplyr)
+library(janitor)
+library(ggplot2)
+library(stringr)
+library(factoextra)
+```
+# Connection
+```{r}
+sc <- spark_connect(master = "local", version = "3.5")
+```
+# Load Dataset
+```{r}
+df1 <- read.csv("/Users/amorphis/Desktop/6110/Final Project/archive/games.csv")
+# Change the platforms from True/False to 1/0
+df1$Windows <- ifelse(df1$Windows, 1, 0)
+df1$Mac <- ifelse(df1$Mac, 1, 0)
+df1$Linux <- ifelse(df1$Linux, 1, 0)
+
+# Lebal Genres
+genre_labels <- factor(df1$Genres, levels = unique(df1$Genres))
+df1$Genre_label <- as.numeric(genre_labels)
+
+df1_selected <- df1 %>%
+  select(Peak.CCU, Price, Positive, Windows, Mac, Linux, Average.playtime.forever, Median.playtime.forever, Genre_label) %>%
+  na.omit()
+
+# Add a column for the number of supported languages
+df1 <- df1 %>%
+  mutate(Language_count = str_count(Supported.languages, ',') + 1)
+
+# Handle cases where the Supported.languages column is empty or NA
+df1$Language_count[is.na(df1$Language_count)] <- 0
+
+# View the first few rows to verify the new column
+head(df1)
+
+# Scale the features
+df1_scaled <- df1_selected %>%
+  mutate(across(everything(), scale))
+
+# Copy dataset to Spark
+zip <- copy_to(sc, df1_scaled, overwrite = TRUE)
+
+# Print the schema and sample of the Spark DataFrame to verify changes
+glimpse(zip)
+zip %>% head() %>% collect()
+```
+```{r}
+# Extract minimum and maximum estimated owners and calculate the average
+df1 <- df1 %>%
+  mutate(Estimated_min = as.numeric(sub("([0-9]+)-([0-9]+)", "\\1", Estimated.owners)),
+         Estimated_max = as.numeric(sub("([0-9]+)-([0-9]+)", "\\2", Estimated.owners)),
+         Estimated_average = (Estimated_min + Estimated_max) / 2)
+
+# Select relevant columns for clustering and handle missing values
+df1_selected <- df1 %>%
+  select(Peak.CCU, Price, Positive, Windows, Mac, Linux, Average.playtime.forever, Median.playtime.forever, Genre_label, Language_count, Estimated_average) %>%
+  na.omit()
+```
+
+# Perform K-Means clustering
+```{r}
+kmeans_model <- zip %>%
+  ml_kmeans(formula = ~ Peak_CCU + Price + Positive + Windows + Mac + Linux + Average_playtime_forever + Median_playtime_forever + Genre_label, k = 3)
+
+# Print the cluster centers
+print(kmeans_model$centers)
+```
+
+```{r}
+# Predict clusters
+predictions <- ml_predict(kmeans_model, zip)
+
+# Add cluster assignments to the dataset
+df1_clustered <- sdf_bind_cols(zip, predictions)
+
+# Collect the results back to R for analysis
+df1_clustered_df <- df1_clustered %>%
+  collect()
+
+# Check the column names to identify the correct ones for visualization
+colnames(df1_clustered_df)
+
+# View the first few rows of the clustered data
+head(df1_clustered_df)
+```
+```{r}
+# Visualize the clusters using ggplot2
+ggplot(df1_clustered_df, aes(x = Price_x, y = Positive_x, color = as.factor(prediction))) +
+  geom_point() +
+  labs(title = "K-Means Clustering of Steam Games", x = "Price", y = "Positive Reviews", color = "Cluster")
+```
+
